@@ -32,7 +32,7 @@ for k, v in actor_eval_model.get_name_mappings_to_training().items():
     content += f"{k}:{v}\n"
 
 # with open("baseline.txt", "w", encoding="utf-8") as f:
-#     f.write(baseline)
+#     f.write(content)
 
 def compare_strings(a: str, b: str) -> bool:
     if a == b:
