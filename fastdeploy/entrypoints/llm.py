@@ -28,6 +28,7 @@ from tqdm import tqdm
 from fastdeploy.engine.args_utils import EngineArgs
 from fastdeploy.engine.engine import LLMEngine
 from fastdeploy.engine.sampling_params import SamplingParams
+from fastdeploy.entrypoints.chat_utils import load_chat_template
 from fastdeploy.entrypoints.openai.tool_parsers import ToolParserManager
 from fastdeploy.plugins.model_register import load_model_register_plugins
 from fastdeploy.utils import (
@@ -74,6 +75,7 @@ class LLM:
         revision: Optional[str] = "master",
         tokenizer: Optional[str] = None,
         enable_logprob: Optional[bool] = False,
+        chat_template: Optional[str] = None,
         **kwargs,
     ):
         load_model_register_plugins()
@@ -101,6 +103,7 @@ class LLM:
         self.master_node_ip = self.llm_engine.cfg.master_ip
         self._receive_output_thread = threading.Thread(target=self._receive_output, daemon=True)
         self._receive_output_thread.start()
+        self.chat_template = load_chat_template(chat_template)
 
     def _check_master(self):
         """
@@ -195,6 +198,7 @@ class LLM:
         sampling_params: Optional[Union[SamplingParams, list[SamplingParams]]] = None,
         use_tqdm: bool = True,
         chat_template_kwargs: Optional[dict[str, Any]] = None,
+        chat_template: Optional[str] = None,
     ):
         """
         Args:
@@ -228,6 +232,9 @@ class LLM:
         if sampling_params_len != 1 and len(messages) != sampling_params_len:
             raise ValueError("messages and sampling_params must be the same length.")
 
+        if chat_template is None:
+            chat_template = self.chat_template
+
         messages_len = len(messages)
         for i in range(messages_len):
             messages[i] = {"messages": messages[i]}
@@ -235,6 +242,7 @@ class LLM:
             prompts=messages,
             sampling_params=sampling_params,
             chat_template_kwargs=chat_template_kwargs,
+            chat_template=chat_template,
         )
 
         topk_logprobs = sampling_params[0].logprobs if sampling_params_len > 1 else sampling_params.logprobs
@@ -288,10 +296,7 @@ class LLM:
                 current_sampling_params = sampling_params[i]
             else:
                 current_sampling_params = sampling_params
-            # enable_thinking = None
-            # if chat_template_kwargs is not None:
-            #     enable_thinking = chat_template_kwargs.get("enable_thinking", None)
-            # self.llm_engine.add_requests(tasks, current_sampling_params, enable_thinking=enable_thinking)
+
             self.llm_engine.add_requests(tasks, current_sampling_params, **kwargs)
         return req_ids
 
@@ -341,7 +346,7 @@ class LLM:
             return result
 
         except Exception as e:
-            llm_logger.error(f"Error building sample logprobs from LogprobsLists: {e}")
+            llm_logger.error(f"Error building sample logprobs from LogprobsLists: {e}, {str(traceback.format_exc())}")
 
     def _run_engine(self, req_ids: list[str], use_tqdm: bool, topk_logprobs: Optional[int] = None):
         """
