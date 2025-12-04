@@ -16,7 +16,9 @@
 
 import copy
 import os
-from typing import Dict
+import shutil
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional
 
 import paddle
 import paddle.distributed as dist
@@ -28,7 +30,7 @@ from fastdeploy.config import FDConfig
 
 @triton.jit
 def _save_routing_kernel(
-    ROUTING_TABLE_BUFFER_PTR,
+    ROUTING_REPLAY_TABLE_PTR,
     TOPK_IDS_PTR,
     BATCH_ID_PER_TOKEN_PTR,
     CU_SEQLENS_Q_PTR,
@@ -70,7 +72,7 @@ def _save_routing_kernel(
 
     # [BLOCK_SIZE_M, BLOCK_SIZE_K]
     output_ptrs = (
-        ROUTING_TABLE_BUFFER_PTR
+        ROUTING_REPLAY_TABLE_PTR
         + batch_ids[:, None] * STRIDE_BUF_SEQ
         + LAYER_IDX * STRIDE_BUF_LAYER
         + token_seq_pos[:, None] * STRIDE_BUF_TOKEN
@@ -85,7 +87,7 @@ def _save_routing_kernel(
 
 
 def save_routing_to_buffer(
-    routing_table_buffer: paddle.Tensor,  # [max_num_seqs, num_layers, max_len, top_k]
+    routing_replay_table: paddle.Tensor,  # [max_num_seqs, num_layers, max_len, top_k]
     topk_ids: paddle.Tensor,  # [token_num, top_k]
     batch_id_per_token: paddle.Tensor,  # [token_num, 1]
     seq_lens_decoder: paddle.Tensor,  # [max_num_seqs, 1]
@@ -102,18 +104,18 @@ def save_routing_to_buffer(
         topk_ids = topk_ids_all[: batch_id_per_token.shape[0], :]
 
     token_num, top_k = topk_ids.shape
-    max_num_seqs, num_hidden_layers, max_model_len, _ = routing_table_buffer.shape
+    max_num_seqs, num_hidden_layers, max_model_len, _ = routing_replay_table.shape
     assert token_num > 0
-    assert topk_ids.shape[1] == routing_table_buffer.shape[3], (topk_ids.shape[1], routing_table_buffer.shape[3])
+    assert topk_ids.shape[1] == routing_replay_table.shape[3], (topk_ids.shape[1], routing_replay_table.shape[3])
     assert batch_id_per_token.shape[0] == token_num, (batch_id_per_token.shape[0], token_num)
     assert seq_lens_decoder.shape[0] == max_num_seqs, (seq_lens_decoder.shape[0], max_num_seqs)
 
     BLOCK_SIZE_M = 128
-    BLOCK_SIZE_K = top_k  # 值一般很小，直接设为 top_k
+    BLOCK_SIZE_K = top_k
 
     grid = (triton.cdiv(token_num, BLOCK_SIZE_M),)
     _save_routing_kernel[grid](
-        routing_table_buffer,
+        routing_replay_table,
         topk_ids,
         batch_id_per_token,
         cu_seqlens_q,
@@ -128,34 +130,12 @@ def save_routing_to_buffer(
     )
 
 
-# max_num_seqs = 4
-# num_layers = 1
-# max_len = 10
-# top_k = 8
-# token_num = 12
-
-# routing_table_buffer = paddle.full([max_num_seqs, num_layers, max_len, top_k], -1, dtype="int32")
-# topk_ids = paddle.randint(0, 384, [token_num, top_k], dtype="int32")
-# batch_id_per_token = paddle.to_tensor([0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 3, 3], dtype="int32").reshape([-1, 1])
-# seq_lens_decoder = paddle.to_tensor([0, 2, 0, 3], dtype="int32").reshape([-1, 1])
-# cu_seqlens_q = paddle.to_tensor([0, 3, 4, 10, 12], dtype="int32").reshape([-1, 1])
-# current_layer_idx = 0
-
-# save_routing_to_buffer(
-#     routing_table_buffer=routing_table_buffer,
-#     topk_ids=topk_ids,
-#     batch_id_per_token=batch_id_per_token,
-#     seq_lens_decoder=seq_lens_decoder,
-#     cu_seqlens_q=cu_seqlens_q,
-#     layer_idx=current_layer_idx,
-# )
-
-
 class RoutingReplayManager:
+    """Request level routing replay table manager"""
+
     def __init__(
         self,
         fd_config: FDConfig,
-        output_dir: str = "./routing_replay_output",
     ):
         self.max_num_seqs = fd_config.parallel_config.max_num_seqs
         self.max_model_len = fd_config.model_config.max_model_len
@@ -163,58 +143,186 @@ class RoutingReplayManager:
         self.moe_top_k = fd_config.model_config.moe_k
         self.tp_rank = fd_config.parallel_config.tensor_parallel_rank
 
-        self.output_dir = output_dir
-
+        self.routing_store = get_routing_store(fd_config=fd_config)
         self.routing_batch_to_request: Dict[int, str] = {}
-
-        self.routing_table_buffer = paddle.full(
+        self.routing_replay_table = paddle.full(
             shape=[self.max_num_seqs, self.num_moe_layers, self.max_model_len, self.moe_top_k],
             fill_value=-1,
             dtype="int32",
         )
 
+    def register_request(self, batch_id: int, request_id: str):
+        """
+        Register a new request to routing replay table
+        Args:
+            batch_id: The batch ID of this request
+            request_id: The global ID of the request is usually executed by the training process in RL
+        """
+        # Save requests that have been finished for the current slot
+        if batch_id in self.routing_batch_to_request:
+            pre_request_id = self._deregister_request(batch_id)
+            self._put_request_to_store(batch_id, pre_request_id)
+        # Register the new request
+        self.routing_batch_to_request[batch_id] = request_id
+
     def _deregister_request(self, batch_id: int) -> str:
+        """
+        Deregister a request from routing replay table
+        """
         assert batch_id in self.routing_batch_to_request
         return self.routing_batch_to_request.pop(batch_id)
 
-    def _clear_buffer_slot(self, batch_id: int):
-        assert 0 <= batch_id < self.max_num_seqs
-        self.routing_table_buffer[batch_id].fill_(-1)
-
-    def _save_routing_to_file(
+    def _put_request_to_store(
         self,
         batch_id: int,
         request_id: str,
     ):
         if self.tp_rank == 0:
-            dir_path = os.path.join(self.output_dir, f"{request_id}")
-            os.makedirs(dir_path, exist_ok=True)
-            batch_buffer = self.routing_table_buffer[batch_id]
+            batch_buffer = self.routing_replay_table[batch_id]
             for layer_id in range(self.num_moe_layers):
                 layer_buffer = batch_buffer[layer_id]
-                print(f"{layer_id=}, {layer_buffer=}")
-                file_path = os.path.join(
-                    dir_path, f"layer_{layer_id}_shape_{self.max_model_len}x{self.moe_top_k}.pdtensor"
-                )
-                paddle.save(layer_buffer, file_path)
+                rollout_id = self.split_request_id(request_id)
+                self.routing_store.put(routing_indices=layer_buffer, rollout_id=rollout_id, layer_idx=layer_id)
 
-        self._clear_buffer_slot(batch_id)
+        self._clear_table_slot(batch_id)
 
-    def clear_buffer(self):
-        self.routing_table_buffer.fill_(-1)
-
-    def register_request(self, batch_id: int, request_id: str):
-        if batch_id in self.routing_batch_to_request:
-            pre_request_id = self._deregister_request(batch_id)
-            self._save_routing_to_file(batch_id, pre_request_id)
-
-        self.routing_batch_to_request[batch_id] = request_id
-
-    def get_buffer(self) -> paddle.Tensor:
-        return self.routing_table_buffer
-
-    def save_tail_routing(self):
+    def put_table_to_store(self):
+        """Put the routin table"""
         batch_ids = copy.deepcopy(list(self.routing_batch_to_request.keys()))
         for batch_id in batch_ids:
             request_id = self._deregister_request(batch_id)
-            self._save_routing_to_file(batch_id, request_id)
+            self._put_request_to_store(batch_id, request_id)
+
+    def _clear_table_slot(self, batch_id: int):
+        assert 0 <= batch_id < self.max_num_seqs
+        self.routing_replay_table[batch_id].fill_(-1)
+
+    def clear_routing_table(self):
+        """Clear all slots of the routing replay table"""
+        self.routing_replay_table.fill_(-1)
+
+    def _clear_store(self):
+        """Clear routing store"""
+        self.routing_store.clear_store()
+
+    def _clear_request_of_store(self, request_id):
+        """Clear one request of routing store"""
+        rollout_id = self.split_request_id(request_id)
+        for layer_idx in range(self.num_moe_layers):
+            self.routing_store.clear(rollout_id=rollout_id, layer_idx=layer_idx)
+
+    def get_request_from_store(self, request_id: str) -> List[paddle.Tensor]:
+        """Get the routing indices of the reuest from store"""
+        routing_list = []
+        rollout_id = self.split_request_id(request_id)
+        for layer_idx in range(self.num_moe_layers):
+            one_layer_routing = self.routing_store.get(rollout_id, layer_idx)
+            routing_list.append(one_layer_routing)
+
+        return routing_list
+
+    def get_routing_table(self) -> paddle.Tensor:
+        return self.routing_replay_table
+
+    def split_request_id(self, request_id: str):
+        """Split the request id to get rollout id"""
+        chat_type, tmp_str = request_id.split("-", 1)
+        assert chat_type == "chatcmpl"
+        reversed_tmp_str = tmp_str[::-1].split("-", 5)
+        rollout_id = reversed_tmp_str[-1][::-1]
+        return rollout_id
+
+
+class RoutingStoreBase(ABC):
+    """Base class for routing store"""
+
+    def __init__(self, fd_config: FDConfig) -> None:
+        self.fd_config = fd_config
+
+    @abstractmethod
+    def put(self, routing_indices: paddle.Tensor, rollout_id: str, layer_idx: Optional[int] = None) -> None:
+        """Put the routing indices into store"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get(self, rollout_id: str, layer_idx: Optional[int] = None) -> paddle.Tensor:
+        """Get the routing indices from store"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear(self, rollout_id: str, layer_idx: Optional[int] = None) -> None:
+        """Clear the routing indices of the request"""
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear_store(
+        self,
+    ):
+        """Clear the routing indices store"""
+        raise NotImplementedError
+
+
+class RoutingStoreLocal(RoutingStoreBase):
+    """Routing Store using local memory"""
+
+    def __init__(self, fd_config) -> None:
+        super().__init__(fd_config=fd_config)
+        self.local_store_dir = fd_config.routing_replay_config.local_store_dir
+
+    def put(self, routing_indices: paddle.Tensor, rollout_id: str, layer_idx: int) -> None:
+        """Put the routing indices into store"""
+        dir_path = os.path.join(self.local_store_dir, f"{rollout_id}")
+        os.makedirs(dir_path, exist_ok=True)
+        file_path = os.path.join(dir_path, f"layer_{layer_idx}.pdtensor")
+        paddle.save(routing_indices, file_path)
+
+    def get(
+        self,
+        rollout_id: str,
+        layer_idx: int = None,
+    ) -> paddle.Tensor:
+        """Get the routing indices from store"""
+        dir_path = os.path.join(self.local_store_dir, f"{rollout_id}")
+        file_path = os.path.join(dir_path, f"layer_{layer_idx}.pdtensor")
+        assert os.path.exists(file_path), f"File not found: {file_path}"
+        layer_routing_indices = paddle.load(file_path)
+
+        return layer_routing_indices
+
+    def clear(
+        self,
+        rollout_id: str,
+        layer_idx: int = None,
+    ) -> None:
+        """Clear the routing indices of the request"""
+        dir_path = os.path.join(self.local_store_dir, f"{rollout_id}")
+        file_path = os.path.join(dir_path, f"layer_{layer_idx}.pdtensor")
+        assert os.path.exists(file_path), f"File not found: {file_path}"
+        os.remove(file_path)
+
+        # Delete empty directory
+        if len(os.listdir(dir_path)) == 0:
+            os.rmdir(dir_path)
+
+    def clear_store(self):
+        """Clear the routing indices store"""
+        if os.path.isdir(self.local_store_dir):
+            for file_name in os.listdir(self.local_store_dir):
+                file_path = os.path.join(self.local_store_dir, file_name)
+                shutil.rmtree(file_path)
+
+
+class RoutingStoreRDMA(RoutingStoreBase):
+    """Routing Store using RDMA"""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+
+def get_routing_store(fd_config: FDConfig) -> RoutingStoreBase:
+    if fd_config.routing_replay_config.routing_store_type == "local":
+        return RoutingStoreLocal(fd_config=fd_config)
+    elif fd_config.routing_replay_config.routing_store_type == "rdma":
+        return RoutingStoreRDMA(fd_config=fd_config)
+    else:
+        raise ValueError("Invalid store type")

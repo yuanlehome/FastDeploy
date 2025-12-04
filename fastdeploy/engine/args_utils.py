@@ -33,6 +33,7 @@ from fastdeploy.config import (
     MobaAttentionConfig,
     ModelConfig,
     ParallelConfig,
+    RoutingReplayConfig,
     SpeculativeConfig,
     TaskOption,
 )
@@ -388,6 +389,14 @@ class EngineArgs:
     Flag to specify the dtype of lm_head as FP32. Default is False (Using model default dtype).
     """
 
+    disable_chunked_mm_input: bool = False
+    """
+    Disable chunked multimodal input processing. When enabled, prevents splitting
+    multimodal (e.g., image) inputs across multiple cache blocks, ensuring each
+    multimodal input is cached as a complete unit. This is required when using
+    prefix caching with multimodal models.
+    """
+
     enable_attention_dp_balance: bool = False
     """
     Flag to enable attention dp balance
@@ -398,18 +407,24 @@ class EngineArgs:
     Max waiting steps to sync all dp for prefill tasks available
     """
 
+    enable_async_download_features: bool = False
+    """
+    Flag to enable async download features. Default is False (disabled).
+    """
+
     enable_eplb: bool = False
     """
     Flag to enable eplb
     """
+
     eplb_config: Optional[Dict[str, Any]] = None
     """
     Configuration for eplb.
     """
 
-    enable_rollout_routing_replay: bool = False
+    routing_replay_config: Optional[Dict[str, Any]] = None
     """
-    Flag to enable rollout routing replay(r3)
+    Flag to rollout routing replay(r3)
     """
 
     def __post_init__(self):
@@ -421,8 +436,6 @@ class EngineArgs:
         if self.splitwise_role == "decode":
             self.enable_prefix_caching = False
         if self.speculative_config is not None:
-            self.enable_prefix_caching = False
-        if self.enable_mm:
             self.enable_prefix_caching = False
         if not current_platform.is_cuda():
             self.enable_prefix_caching = False
@@ -709,6 +722,12 @@ class EngineArgs:
             help="Enable expert parallelism.",
         )
         parallel_group.add_argument(
+            "--enable-async-download-features",
+            action="store_true",
+            default=EngineArgs.enable_async_download_features,
+            help="Enable async download features.",
+        )
+        parallel_group.add_argument(
             "--enable-eplb",
             action="store_true",
             default=EngineArgs.enable_eplb,
@@ -721,10 +740,10 @@ class EngineArgs:
             help="Config of eplb.",
         )
         parallel_group.add_argument(
-            "--enable-rollout-routing-replay",
-            action="store_true",
-            default=EngineArgs.enable_rollout_routing_replay,
-            help="Flag to enable rollout routing replay(r3).",
+            "--routing-replay-config",
+            type=json.loads,
+            default=EngineArgs.routing_replay_config,
+            help="Flag of rollout routing replay(r3).",
         )
 
         # Load group
@@ -852,6 +871,12 @@ class EngineArgs:
             type=lambda s: s.split(",") if s else None,
             default=EngineArgs.rdma_comm_ports,
             help="ports for rdma communication.",
+        )
+        perf_group.add_argument(
+            "--disable-chunked-mm-input",
+            action="store_true",
+            default=EngineArgs.disable_chunked_mm_input,
+            help="Disable chunked mm input.",
         )
 
         perf_group.add_argument(
@@ -1065,6 +1090,14 @@ class EngineArgs:
                 eplb_args[k] = v
         return EPLBConfig(eplb_args)
 
+    def create_routing_repaly_config(self) -> RoutingReplayConfig:
+        """ """
+        routing_replay_args = asdict(self)
+        if self.routing_replay_config is not None:
+            for k, v in self.routing_replay_config.items():
+                routing_replay_args[k] = v
+        return RoutingReplayConfig(routing_replay_args)
+
     def create_engine_config(self, port_availability_check: bool = True) -> FDConfig:
         """
         Create and return a Config object based on the current settings.
@@ -1107,6 +1140,7 @@ class EngineArgs:
         graph_opt_cfg.update_use_cudagraph(self.use_cudagraph)
         moba_attention_config = self.create_moba_attention_config()
         eplb_cfg = self.create_eplb_config()
+        routing_replay_config = self.create_routing_repaly_config()
 
         early_stop_cfg = self.create_early_stop_config()
         early_stop_cfg.update_enable_early_stop(self.enable_early_stop)
@@ -1152,5 +1186,5 @@ class EngineArgs:
             early_stop_config=early_stop_cfg,
             enable_attention_dp_balance=self.enable_attention_dp_balance,
             attention_dp_time_out_iters=self.attention_dp_time_out_iters,
-            enable_rollout_routing_replay=self.enable_rollout_routing_replay,
+            routing_replay_config=routing_replay_config,
         )

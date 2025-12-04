@@ -111,7 +111,7 @@ class ForwardMeta:
     # KV caches
     caches: Optional[list[paddle.Tensor]] = None
     # Routing Replay table buffer
-    routing_table_buffer: Optional[paddle.Tensor] = None
+    routing_replay_table: Optional[paddle.Tensor] = None
 
     def clear_caches(self):
         """Safely clean up the caches"""

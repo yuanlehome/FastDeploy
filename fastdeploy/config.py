@@ -349,6 +349,8 @@ class ParallelConfig:
         self.do_profile: bool = False
         # Use internode_ll_two_stage or not
         self.use_internode_ll_two_stage: bool = False
+        # enable async download features
+        self.enable_async_download_features: bool = False
 
         self.max_num_batched_tokens: int = 2048
 
@@ -360,6 +362,7 @@ class ParallelConfig:
         self.guided_decoding_backend: str = None
         # disable any whitespace for guided decoding
         self.disable_any_whitespace: bool = True
+
         self.pod_ip: str = None
         # enable the custom all-reduce kernel and fall back to NCCL(dist.all_reduce).
         self.disable_custom_all_reduce: bool = False
@@ -970,6 +973,7 @@ class CacheConfig:
         self.cache_dtype = "bfloat16"
         self.model_cfg = None
         self.enable_chunked_prefill = False
+        self.disable_chunked_mm_input = False
         self.rdma_comm_ports = None
         self.cache_transfer_protocol = None
         self.pd_comm_port = None
@@ -993,7 +997,9 @@ class CacheConfig:
             self.enable_hierarchical_cache = True
 
         if self.model_cfg is not None:
-            if self.model_cfg.quantization_config is not None:
+            if self.model_cfg.quantization is not None and isinstance(self.model_cfg.quantization, dict):
+                self.cache_dtype = self.model_cfg.quantization.get("kv_cache_quant_type", self.cache_dtype)
+            elif self.model_cfg.quantization_config is not None:
                 self.cache_dtype = self.model_cfg.quantization_config.get("kv_cache_quant_type", self.cache_dtype)
             if (
                 hasattr(self.model_cfg, "num_key_value_heads")
@@ -1157,6 +1163,31 @@ class CommitConfig:
         logger.info("=============================================================")
 
 
+class RoutingReplayConfig:
+    """Configuration for Routing Replay used in RL training"""
+
+    def __init__(self, args) -> None:
+        self.enable_routing_replay: bool = False
+        self.routing_store_type: str = "local"
+
+        # Local routing store
+        self.local_store_dir: str = "./routing_replay_output"
+
+        # RDMA routing store
+        pass
+
+        if args is not None:
+            for key, value in args.items():
+                if hasattr(self, key) and value != "None":
+                    setattr(self, key, value)
+
+    def to_json_string(self):
+        """
+        Convert routing replay config to json string.
+        """
+        return json.dumps({key: value for key, value in self.__dict__.items()})
+
+
 class FDConfig:
     """
     The configuration class which contains all fastdeploy-related configuration. This
@@ -1200,7 +1231,7 @@ class FDConfig:
         test_mode=False,
         enable_attention_dp_balance: bool = False,
         attention_dp_time_out_iters: int = 0,
-        enable_rollout_routing_replay: bool = False,
+        routing_replay_config: Optional[RoutingReplayConfig] = None,
     ):
         self.model_config: ModelConfig = model_config  # type: ignore
         self.cache_config: CacheConfig = cache_config  # type: ignore
@@ -1216,9 +1247,10 @@ class FDConfig:
         self.cache_config: CacheConfig = cache_config  # type: ignore
         self.eplb_config: Optional[EPLBConfig] = eplb_config
         self.moba_attention_config: Optional[MobaAttentionConfig] = moba_attention_config
+        self.routing_replay_config = routing_replay_config
         self.enable_attention_dp_balance = enable_attention_dp_balance
         self.attention_dp_time_out_iters = attention_dp_time_out_iters
-        self.enable_rollout_routing_replay = enable_rollout_routing_replay
+
         # Initialize cuda graph capture list
         max_capture_shape = self.parallel_config.max_num_seqs
         if self.speculative_config is not None and self.speculative_config.method == "mtp":
