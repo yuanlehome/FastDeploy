@@ -425,6 +425,14 @@ class EngineClient:
                 api_server_logger.warning(
                     f"req_id: {data['request_id']}, reasoning_max_tokens exceeds max_tokens, the value of reasoning_max_tokens will be adjusted to {data['max_tokens']}"
                 )
+        if data.get("response_max_tokens") is not None:
+            if data["response_max_tokens"] < 1:
+                raise ParameterError("response_max_tokens", "response_max_tokens must be greater than 1")
+            if data["response_max_tokens"] > data["max_tokens"]:
+                data["response_max_tokens"] = data["max_tokens"]
+                api_server_logger.warning(
+                    f"req_id: {data['request_id']}, response_max_tokens exceeds max_tokens, the value of response_max_tokens will be adjusted to {data['max_tokens']}"
+                )
         if data.get("temperature") is not None and abs(data["temperature"]) < 1e-6:
             data["temperature"] = 1e-6
         # logprobs

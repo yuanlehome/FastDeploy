@@ -646,6 +646,8 @@ class GPUModelRunner(ModelRunnerBase):
                         # Disable thinking
                         self.share_inputs["max_think_lens"][idx : idx + 1, :] = -1
                         self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
+                    response_max_tokens = request.get("response_max_tokens", None)
+                    self.share_inputs["max_reply_lens"][idx : idx + 1, :] = response_max_tokens if response_max_tokens is not None else -1
 
                 if isinstance(request.prompt_token_ids, np.ndarray):
                     prompt_token_ids = request.prompt_token_ids.tolist()
@@ -926,6 +928,8 @@ class GPUModelRunner(ModelRunnerBase):
                         # Disable thinking
                         self.share_inputs["max_think_lens"][idx : idx + 1, :] = -1
                         self.share_inputs["limit_think_status"][idx : idx + 1, :] = 0
+                    response_max_tokens = request.get("response_max_tokens", None)
+                    self.share_inputs["max_reply_lens"][idx : idx + 1, :] = response_max_tokens if response_max_tokens is not None else -1
 
             def get_attr_from_request(request, attr, default_value=None):
                 res = request.get(attr, default_value)
@@ -1233,6 +1237,22 @@ class GPUModelRunner(ModelRunnerBase):
         # Initialize thinking related buffers
         self.share_inputs["max_think_lens"] = paddle.full(shape=[max_num_seqs, 1], fill_value=-1, dtype="int32")
         self.share_inputs["limit_think_status"] = paddle.full(shape=[max_num_seqs, 1], fill_value=0, dtype="int32")
+        self.share_inputs["max_reply_lens"] = paddle.full(shape=[max_num_seqs, 1], fill_value=-1, dtype="int32")
+        # Compute inject_token_ids based on limit strategy
+        _limit_strategy = envs.FD_LIMIT_THINKING_CONTENT_TRUNCATE_STR
+        _think_end_id = self.model_config.think_end_id if hasattr(self.model_config, "think_end_id") else -1
+        _line_break_id = self.model_config.line_break_id if hasattr(self.model_config, "line_break_id") else -1
+        if _think_end_id > 0:
+            if _limit_strategy == "</think>":
+                _inject_ids = [_think_end_id]
+            elif _limit_strategy == "\n</think>\n\n" and _line_break_id > 0:
+                _inject_ids = [_line_break_id, _think_end_id, _line_break_id, _line_break_id]
+            else:
+                _inject_ids = []
+        else:
+            _inject_ids = []
+        self.share_inputs["inject_token_ids"] = paddle.to_tensor(_inject_ids, dtype="int64")
+        self.share_inputs["splitwise_role_is_decode"] = self.scheduler_config.splitwise_role == "decode"
 
         # Initialize rotary position embedding
         if not self.enable_mm:
@@ -1433,6 +1453,7 @@ class GPUModelRunner(ModelRunnerBase):
             fill_paddle_tensor(self.share_inputs, "enable_thinking", True)
             fill_paddle_tensor(self.share_inputs, "max_think_lens", -1)
             fill_paddle_tensor(self.share_inputs, "limit_think_status", 0)
+            fill_paddle_tensor(self.share_inputs, "max_reply_lens", -1)
 
             # Reset reasoning buffers
             fill_paddle_tensor(self.share_inputs, "reasoning_status", 0)
