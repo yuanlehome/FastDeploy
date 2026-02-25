@@ -144,8 +144,11 @@ class Ernie4_5Processor(BaseDataProcessor):
         # truncate prompts that exceed the length limit
         if max_model_len is not None and len(request.prompt_token_ids) > max_model_len:
             request.prompt_token_ids = request.prompt_token_ids[: max_model_len - 1]
+        max_tokens = max_model_len - len(request.prompt_token_ids)
         if request.get("max_tokens") is None:
-            request.set("max_tokens", max(1, max_model_len - len(request.prompt_token_ids)))
+            request["max_tokens"] = max(1, max_tokens)
+        else:
+            request["max_tokens"] = min(max_tokens, request["max_tokens"])
         if request.get("temperature") < _SAMPLING_EPS:
             # zero temperature is equivalent to greedy sampling
             request.set("temperature", 1)
@@ -222,16 +225,29 @@ class Ernie4_5Processor(BaseDataProcessor):
         # truncate prompts that exceed the length limit
         if max_model_len is not None and len(request["prompt_token_ids"]) > max_model_len:
             request["prompt_token_ids"] = request["prompt_token_ids"][: max_model_len - 1]
+        max_tokens = max_model_len - len(request["prompt_token_ids"])
         if request.get("max_tokens") is None:
-            request["max_tokens"] = max(1, max_model_len - len(request["prompt_token_ids"]))
+            request["max_tokens"] = max(1, max_tokens)
+        else:
+            request["max_tokens"] = min(max_tokens, request["max_tokens"])
         if request.get("temperature") < _SAMPLING_EPS:
             # zero temperature is equivalent to greedy sampling
             request["temperature"] = 1
         if request.get("top_p") < _SAMPLING_EPS:
             request["top_p"] = _SAMPLING_EPS
-        if self.reasoning_parser and self.reasoning_parser.__class__.__name__ == "ErnieX1ReasoningParser":
-            request["enable_thinking"] = True
 
+        if self.reasoning_parser:
+            model_status = self.reasoning_parser.get_model_status(request["prompt_token_ids"])
+            parts = request["request_id"].split("_")
+            if len(parts) > 1:
+                real_req_id = parts[0]
+                index = int(parts[1])
+                n = request.get("n", 1)
+                for idx in range(index * n, (index + 1) * n):
+                    self.model_status_dict[f"{real_req_id}_{idx}"] = model_status
+            else:
+                self.model_status_dict[request["request_id"]] = model_status
+            request["enable_thinking"] = model_status == "think_start"
         data_processor_logger.info(f"Processed request dict: {request}")
         return request
 

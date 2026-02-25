@@ -431,7 +431,7 @@ class AsyncLLMEngine:
                 )
 
                 if request.get("reasoning_max_tokens") is None:
-                    default_reasoning_max_tokens = max(int(request.get("max_tokens") * 0.8), 1)
+                    default_reasoning_max_tokens = max(int(request.get("max_tokens") * 0.8), 0)
                     request.set("reasoning_max_tokens", default_reasoning_max_tokens)
 
                 min_tokens = request.get("min_tokens")

@@ -71,6 +71,7 @@ class SamplingParams:
             can complete the sequence.
         max_tokens: Maximum number of tokens to generate per output sequence.
         reasoning_max_tokens: Maximum number of tokens to generate for reasoning per output sequence.
+        response_max_tokens: Maximum number of tokens to generate for response per output sequence.
         min_tokens: Minimum number of tokens to generate per output sequence
             before EOS or stop_token_ids can be generated
         logprobs: Number of log probabilities to return per output token.
@@ -97,6 +98,7 @@ class SamplingParams:
     stop_seqs_len: Optional[int] = None
     max_tokens: Optional[int] = None
     reasoning_max_tokens: Optional[int] = None
+    response_max_tokens: Optional[int] = None
     min_tokens: int = 1
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
@@ -200,7 +202,7 @@ class SamplingParams:
             raise ValueError(f"max_tokens must be at least 1, got {self.max_tokens}.")
 
         if self.reasoning_max_tokens is not None and self.reasoning_max_tokens > self.max_tokens:
-            raise ValueError(f"reasoning_max_tokens must be less than max_tokens, got {self.reasoning_max_tokens}.")
+            self.reasoning_max_tokens = self.max_tokens
 
         if self.min_tokens < 0:
             raise ValueError(f"min_tokens must be greater than or equal to 0, " f"got {self.min_tokens}.")
