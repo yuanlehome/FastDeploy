@@ -1340,6 +1340,33 @@ class GPUModelRunner(ModelRunnerBase):
         self.forward_meta.is_zero_size = self.forward_meta.ids_remove_padding.shape[0] == 0
         self.forward_meta.exist_prefill = self.exist_prefill()
 
+        # Decode Context Parallel (DCP): compute local seq lens for this rank
+        dcp_size = self.parallel_config.decode_context_parallel_size
+        if dcp_size > 1:
+            from fastdeploy.distributed.dcp_comm import get_dcp_local_seq_lens
+
+            dcp_rank = self.parallel_config.dcp_rank
+            interleave = self.parallel_config.cp_kv_cache_interleave_size
+
+            # context_kv_lens = seq_lens_decoder (decode history, excluding new token)
+            seq_lens_decoder = self.share_inputs["seq_lens_decoder"]
+
+            # Write into the static buffer in share_inputs so CUDA Graph sees a
+            # fixed tensor address rather than a newly-allocated tensor each step.
+            self.share_inputs["dcp_context_kv_lens"].copy_(
+                get_dcp_local_seq_lens(seq_lens_decoder, dcp_size, dcp_rank, interleave),
+                False,
+            )
+            self.forward_meta.dcp_context_kv_lens = self.share_inputs["dcp_context_kv_lens"]
+
+            # Static upper bound: ceil(max_seq_len / (dcp_size * interleave)) * interleave
+            # No GPU-CPU sync needed (uses model config max_model_len)
+            max_seq_len = self.model_config.max_model_len
+            num_partitions = dcp_size * interleave
+            self.forward_meta.max_dcp_context_kv_len = (
+                (max_seq_len + num_partitions - 1) // num_partitions
+            ) * interleave
+
     def initialize_kv_cache(self, profile: bool = False) -> None:
         """
         Initialize kv cache

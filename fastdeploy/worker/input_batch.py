@@ -17,7 +17,13 @@
 import paddle
 from paddleformers.utils.log import logger
 
-from fastdeploy.config import CacheConfig, FDConfig, ModelConfig, SpeculativeConfig
+from fastdeploy.config import (
+    CacheConfig,
+    FDConfig,
+    ModelConfig,
+    ParallelConfig,
+    SpeculativeConfig,
+)
 from fastdeploy.model_executor.layers.rotary_embedding import get_rope
 from fastdeploy.model_executor.logits_processor import build_logits_processors
 from fastdeploy.platforms import current_platform
@@ -91,6 +97,7 @@ class InputBatch:
         self.running_requests_ids = []
         self.fd_config: FDConfig = fd_config
         self.model_config: ModelConfig = fd_config.model_config
+        self.parallel_config: ParallelConfig = fd_config.parallel_config
         self.cache_config: CacheConfig = fd_config.cache_config
         self.scheduler_config = fd_config.scheduler_config
         self.speculative_config: SpeculativeConfig = fd_config.speculative_config
@@ -226,9 +233,17 @@ class InputBatch:
             )
 
         # Set block tables
+        # With DCP enabled, each rank stores only 1/dcp_world_size of the tokens,
+        # so the block_table only needs ceil(max_model_len / virtual_block_size) entries
+        # per sequence, where virtual_block_size = block_size * dcp_world_size.
+        dcp_world_size = self.parallel_config.decode_context_parallel_size
+        virtual_block_size = self.cache_config.block_size * dcp_world_size
+        # DCP: static buffer for local kv lengths, avoids dynamic allocation under CUDA Graph
+        if dcp_world_size > 1:
+            self.dcp_context_kv_lens = paddle.full([max_num_seqs], 0, dtype="int32")
         pre_max_block_num = (
-            self.model_config.max_model_len + self.cache_config.block_size - 1
-        ) // self.cache_config.block_size + self.cache_config.enc_dec_block_num
+            self.model_config.max_model_len + virtual_block_size - 1
+        ) // virtual_block_size + self.cache_config.enc_dec_block_num
         self.block_tables = paddle.full([max_num_seqs, pre_max_block_num], -1, dtype="int32")
 
         # Initialize free list

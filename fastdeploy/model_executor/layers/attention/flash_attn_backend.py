@@ -72,6 +72,8 @@ from fastdeploy.spec_decode import SpecMethod
 
 FLASH_ATTN_VERSION = None
 
+# DCP imports
+
 
 def init_flash_attn_version():
     """
@@ -274,6 +276,17 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_partition_size: int = int(os.getenv("FLAGS_max_partition_size", 1024))
         if FLASH_ATTN_VERSION is None:
             init_flash_attn_version()
+
+        # Decode Context Parallel (DCP) initialization
+        self.dcp_world_size = fd_config.parallel_config.dcp_world_size
+        self.dcp_rank = fd_config.parallel_config.dcp_rank
+        self.dcp_group = getattr(fd_config.parallel_config, "dcp_group", None)
+        self.cp_kv_cache_interleave_size = fd_config.parallel_config.cp_kv_cache_interleave_size
+        if self.dcp_world_size > 1:
+            logger.info(
+                f"FlashAttentionBackend DCP enabled: dcp_world_size={self.dcp_world_size}, "
+                f"dcp_rank={self.dcp_rank}, interleave_size={self.cp_kv_cache_interleave_size}"
+            )
 
     def get_attention_meta(self):
         """get_attention_meta"""

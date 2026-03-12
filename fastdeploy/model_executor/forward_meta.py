@@ -160,6 +160,12 @@ class ForwardMeta:
 
     position_ids: Optional[paddle.Tensor] = None
 
+    # Decode Context Parallel (DCP) fields
+    # Per-request local KV sequence lengths on this DCP rank
+    dcp_context_kv_lens: Optional[paddle.Tensor] = None
+    # Static upper bound of max local KV length (avoids GPU-CPU sync)
+    max_dcp_context_kv_len: int = 0
+
     def clear_caches(self):
         """Safely clean up the caches"""
         if self.caches:

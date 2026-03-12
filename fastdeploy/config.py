@@ -646,6 +646,10 @@ class ParallelConfig:
         # ep_prefill_use_worst_num_tokens
         self.ep_prefill_use_worst_num_tokens: bool = False
 
+        # Decode Context Parallel (DCP)
+        self.decode_context_parallel_size: int = 1
+        self.cp_kv_cache_interleave_size: int = 1
+
         self.pod_ip: str = None
         # enable the custom all-reduce kernel and fall back to NCCL(dist.all_reduce).
         self.disable_custom_all_reduce: bool = False
@@ -706,6 +710,38 @@ class ParallelConfig:
             dist.collective._set_custom_gid(self.data_parallel_size + tp_gid_offset)
             self.ep_group = dist.new_group(range(self.expert_parallel_size))
             dist.collective._set_custom_gid(None)
+
+        # Decode Context Parallel (DCP) group
+        dcp_size = self.decode_context_parallel_size
+        self.dcp_group = None
+        if dcp_size > 1:
+            assert self.tensor_parallel_size % dcp_size == 0, (
+                f"tensor_parallel_size ({self.tensor_parallel_size}) must be "
+                f"divisible by decode_context_parallel_size ({dcp_size})."
+            )
+            tp_start = self.data_parallel_rank * self.tensor_parallel_size
+            tp_end = tp_start + self.tensor_parallel_size
+            all_tp_ranks = list(range(tp_start, tp_end))
+            # Split TP ranks into DCP subgroups of size dcp_size
+            # e.g., tp=8, dcp=4 → subgroups: [0,1,2,3], [4,5,6,7]
+            dcp_gid_offset = self.data_parallel_size + tp_gid_offset + 100
+            for i in range(0, len(all_tp_ranks), dcp_size):
+                dcp_ranks = all_tp_ranks[i : i + dcp_size]
+                dist.collective._set_custom_gid(dcp_gid_offset + i // dcp_size)
+                group = dist.new_group(dcp_ranks)
+                dist.collective._set_custom_gid(None)
+                if self.tensor_parallel_rank in dcp_ranks:
+                    self.dcp_group = group
+                    self.dcp_rank = dcp_ranks.index(self.tensor_parallel_rank)
+                    self.dcp_world_size = dcp_size
+            logger.info(
+                f"DCP enabled: dcp_size={dcp_size}, dcp_rank={self.dcp_rank}, "
+                f"dcp_group={self.dcp_group}, "
+                f"cp_kv_cache_interleave_size={self.cp_kv_cache_interleave_size}"
+            )
+        else:
+            self.dcp_rank = 0
+            self.dcp_world_size = 1
         logger.info(
             f"data_parallel_size: {self.data_parallel_size}, tensor_parallel_size: {self.tensor_parallel_size}, expert_parallel_size: {self.expert_parallel_size}, data_parallel_rank: {self.data_parallel_rank}, tensor_parallel_rank: {self.tensor_parallel_rank}, expert_parallel_rank: {self.expert_parallel_rank}, tp_group: {self.tp_group}."
         )
@@ -1990,7 +2026,13 @@ class FDConfig:
         if self.long_prefill_token_threshold == 0:
             self.long_prefill_token_threshold = int(self.model_config.max_model_len * 0.04)
 
-        self.cache_config.max_block_num_per_seq = int(self.model_config.max_model_len // self.cache_config.block_size)
+        # With DCP, each rank stores only 1/dcp_world_size of the KV cache.
+        # max_block_num_per_seq must be calculated using the virtual block size
+        # (physical block_size * dcp_world_size) so that block allocation is
+        # aligned to virtual-block boundaries and all DCP ranks stay consistent.
+        dcp_world_size = self.parallel_config.decode_context_parallel_size
+        effective_block_size_for_max = self.cache_config.block_size * dcp_world_size
+        self.cache_config.max_block_num_per_seq = int(self.model_config.max_model_len // effective_block_size_for_max)
         self.cache_config.postprocess(self.get_max_chunk_tokens(), self.scheduler_config.max_num_seqs)
         if self.model_config is not None and self.model_config.enable_mm and not envs.ENABLE_V1_KVCACHE_SCHEDULER:
             self.cache_config.enable_prefix_caching = False

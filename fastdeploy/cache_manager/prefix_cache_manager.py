@@ -77,6 +77,15 @@ class PrefixCacheManager:
             self.num_gpu_blocks = self.cache_config.prefill_kvcache_block_num
         self.num_cpu_blocks = self.cache_config.num_cpu_blocks
 
+        # DCP: each rank stores only 1/dcp_world_size of tokens, so prefix-cache
+        # hits must land on virtual-block boundaries (multiples of dcp_world_size
+        # physical blocks) to ensure all ranks stay consistent.
+        self.dcp_world_size = getattr(
+            getattr(config, "parallel_config", None),
+            "decode_context_parallel_size",
+            1,
+        )
+
         self.gpu_free_block_list = list(range(self.num_gpu_blocks - 1, -1, -1))
         if self.num_cpu_blocks > 0:
             self.cpu_free_block_list = list(range(self.num_cpu_blocks - 1, -1, -1))
@@ -970,6 +979,54 @@ class PrefixCacheManager:
                     gpu_match_token_num,
                     cpu_match_token_num,
                 ) = self.match_block(req_id, input_ids, block_size)
+
+                # DCP: trim matched blocks to a virtual-block-aligned boundary.
+                # A virtual block spans dcp_world_size physical blocks across all ranks.
+                # All DCP ranks must agree on which virtual blocks are cached; partial
+                # virtual-block hits would leave ranks inconsistent.
+                if self.dcp_world_size > 1:
+                    total_matched = len(match_gpu_block_ids) + len(match_cpu_block_ids)
+                    aligned = (total_matched // self.dcp_world_size) * self.dcp_world_size
+                    if aligned < total_matched:
+                        to_drop = total_matched - aligned
+                        # Drop from the end: CPU blocks are appended after GPU blocks.
+                        cpu_drop = min(to_drop, len(match_cpu_block_ids))
+                        if cpu_drop:
+                            # Revert the swap status of trimmed CPU nodes so they
+                            # remain CPU-resident (not queued for swap-in).
+                            trimmed_swap_ids = swap_node_ids[-cpu_drop:]
+                            with self.cache_status_lock:
+                                for node_id in trimmed_swap_ids:
+                                    if node_id in self.node_map:
+                                        node = self.node_map[node_id]
+                                        if node.cache_status == CacheStatus.SWAP2GPU:
+                                            node.cache_status = CacheStatus.CPU
+                            match_cpu_block_ids = match_cpu_block_ids[:-cpu_drop]
+                            swap_node_ids = swap_node_ids[:-cpu_drop]
+                            cpu_match_token_num -= cpu_drop * block_size
+                            to_drop -= cpu_drop
+                        gpu_drop = to_drop  # remaining drops come from GPU blocks
+                        if gpu_drop:
+                            match_gpu_block_ids = match_gpu_block_ids[:-gpu_drop]
+                            gpu_match_token_num -= gpu_drop * block_size
+                        # Walk the radix tree to find the node at the trimmed depth.
+                        # Hash computation must follow the same chaining as match_block.
+                        final_blocks = aligned
+                        node = self.radix_tree_root
+                        token_pos = 0
+                        prefix_key = []
+                        while token_pos < final_blocks * block_size:
+                            token_block = input_ids[token_pos : token_pos + block_size]
+                            if len(token_block) < block_size:
+                                break
+                            hash_value = get_hash_str(token_block, prefix_key)
+                            prefix_key = [hash_value]
+                            if hash_value in node.children:
+                                node = node.children[hash_value]
+                                token_pos += block_size
+                            else:
+                                break
+                        match_block_node = node
                 match_gpu_blocks_num = len(match_gpu_block_ids)
                 matched_token_num_in_cpu_and_gpu = gpu_match_token_num + cpu_match_token_num
                 # check enough gpu memory to allocate cache

@@ -551,6 +551,20 @@ class EngineArgs:
     Flag to enable prefill_use_worst_num_tokens. Default is False (disabled).
     """
 
+    decode_context_parallel_size: int = 1
+    """
+    Decode Context Parallel (DCP) group size. DCP splits KV cache along
+    the sequence dimension across ranks within each TP group.
+    Must divide tensor_parallel_size evenly. Default 1 means DCP disabled.
+    """
+
+    cp_kv_cache_interleave_size: int = 1
+    """
+    KV cache interleave granularity (number of tokens) for DCP.
+    Controls how tokens are round-robin assigned to DCP ranks.
+    1 means per-token interleave; block_size means per-block interleave.
+    """
+
     def __post_init__(self):
         """
         Post-initialization processing to set default tokenizer if not provided.
@@ -1070,6 +1084,19 @@ class EngineArgs:
             action="store_true",
             default=EngineArgs.ep_prefill_use_worst_num_tokens,
             help="Enable prefill use worst num tokens for EP.",
+        )
+        parallel_group.add_argument(
+            "--decode-context-parallel-size",
+            "-dcp",
+            type=int,
+            default=EngineArgs.decode_context_parallel_size,
+            help="Decode Context Parallel (DCP) group size. Must divide tensor_parallel_size.",
+        )
+        parallel_group.add_argument(
+            "--cp-kv-cache-interleave-size",
+            type=int,
+            default=EngineArgs.cp_kv_cache_interleave_size,
+            help="KV cache interleave granularity for DCP (number of tokens).",
         )
 
         # Load group
