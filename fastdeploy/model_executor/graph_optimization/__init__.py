@@ -13,3 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+
+from fastdeploy.model_executor.graph_optimization.cuda_graph_fn import (
+    CudaGraphFnBackend,
+    cuda_graph_fn,
+)
+
+__all__ = ["CudaGraphFnBackend", "cuda_graph_fn"]

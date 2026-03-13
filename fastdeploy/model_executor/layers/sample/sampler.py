@@ -27,6 +27,7 @@ from paddleformers.utils.log import logger
 
 from fastdeploy.config import FDConfig
 from fastdeploy.envs import FD_FILL_BITMASK_BATCH
+from fastdeploy.model_executor.graph_optimization.cuda_graph_fn import cuda_graph_fn
 from fastdeploy.model_executor.guided_decoding import LogitsProcessorBase
 from fastdeploy.model_executor.layers.sample.early_stopper import (
     get_early_stopper_cls_from_stragegy,
@@ -94,6 +95,41 @@ def padding_sampling_params(top_p, top_k, infer_seed, seq_lens_this_time, seq_le
     return top_p_padding, top_k_padding, topp_seed
 
 
+@cuda_graph_fn(
+    capture_sizes=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+    num_warmups=2,
+    size_from=0,  # batch dimension is shape[0] of `probs`
+)
+def _compute_sampling_mask_gpu(
+    probs: paddle.Tensor,
+    top_p: paddle.Tensor,
+) -> List[paddle.Tensor]:
+    """
+    Pure-GPU nucleus-mask kernel for CUDA graph capture.
+
+    Args:
+        probs: [B, V] softmax probabilities (GPU).
+        top_p: [B, 1] per-request top-p threshold (GPU).
+
+    Returns:
+        [sorted_indices, k_per_row]:
+            sorted_indices: [B, V] int64 — vocab indices sorted by descending prob.
+            k_per_row:      [B]    int32 — number of retained tokens per request.
+    """
+    sorted_indices = paddle.argsort(probs, axis=-1, descending=True)
+    sorted_probs = paddle.take_along_axis(probs, sorted_indices, axis=-1)
+    cum_probs = paddle.cumsum(sorted_probs, axis=-1)
+
+    # mask_cum[i, j] == True ↔ the j-th token (descending order) is retained.
+    mask_cum = (cum_probs - sorted_probs) < top_p  # [B, V]
+
+    # top_p >= 1.0 → keep all tokens
+    full_mask = (top_p >= 1.0).expand_as(mask_cum)
+    mask_cum = paddle.where(full_mask, paddle.ones_like(mask_cum), mask_cum)
+
+    return [sorted_indices, mask_cum.astype("int32").sum(axis=-1)]
+
+
 def _compute_sampling_mask(
     probs: paddle.Tensor,
     top_p: paddle.Tensor,
@@ -112,6 +148,13 @@ def _compute_sampling_mask(
     prefix of True values per row.  We compute k_i = sum(mask_cum[i]) on GPU
     and transfer only sorted_indices[:, :max_k].
 
+    Implementation note:
+        The GPU-only kernel (_compute_sampling_mask_gpu) is decorated with
+        @cuda_graph_fn so it is captured into a CUDA graph on first call for
+        each batch size and replayed on subsequent calls.  D2H transfers
+        (.cpu()/.numpy()/.item()) remain in this outer function and execute
+        eagerly after the graph replay.
+
     Args:
         probs: [num_reqs, vocab_size] softmax probabilities (GPU).
         top_p: [num_reqs, 1] top-p threshold per request (GPU).
@@ -122,20 +165,11 @@ def _compute_sampling_mask(
     """
     real_bsz = probs.shape[0]
     top_p = top_p[:real_bsz]
-    sorted_indices = paddle.argsort(probs, axis=-1, descending=True)
-    sorted_probs = paddle.take_along_axis(probs, sorted_indices, axis=-1)
-    cum_probs = paddle.cumsum(sorted_probs, axis=-1)
 
-    # mask_cum[i, j] = True  ↔  the j-th token (in sorted order) is retained.
-    # Since probs are sorted descending, this is always a contiguous prefix.
-    mask_cum = (cum_probs - sorted_probs) < top_p  # [B, V]
+    # GPU part: captured in CUDA graph (warmup → capture → replay)
+    sorted_indices, k_per_row = _compute_sampling_mask_gpu(probs, top_p)
 
-    # top_p >= 1.0: keep all tokens
-    full_mask = (top_p >= 1.0).expand_as(mask_cum)  # [B, V]
-    mask_cum = paddle.where(full_mask, paddle.ones_like(mask_cum), mask_cum)
-
-    # k_per_row[i] = number of retained tokens for request i  (cheap int op, stays GPU)
-    k_per_row = mask_cum.astype("int32").sum(axis=-1)  # [B]
+    # CPU/D2H part: must remain outside the CUDA graph
     max_k = int(k_per_row.max().item())
 
     # D2H transfer: B * max_k int32 values  (vs. B * V bool values previously)
