@@ -116,8 +116,11 @@ def _compute_sampling_mask_gpu(
             sorted_indices: [B, V] int64 — vocab indices sorted by descending prob.
             k_per_row:      [B]    int32 — number of retained tokens per request.
     """
-    sorted_indices = paddle.argsort(probs, axis=-1, descending=True)
-    sorted_probs = paddle.take_along_axis(probs, sorted_indices, axis=-1)
+    # paddle.argsort uses Thrust which calls cudaStreamSynchronize internally and
+    # is incompatible with CUDA graph stream capture.  paddle.topk with k=V is
+    # equivalent (full sort) but uses CUB's top-k kernel which is graph-safe.
+    vocab_size = probs.shape[-1]
+    sorted_probs, sorted_indices = paddle.topk(probs, k=vocab_size, axis=-1, largest=True, sorted=True)
     cum_probs = paddle.cumsum(sorted_probs, axis=-1)
 
     # mask_cum[i, j] == True ↔ the j-th token (descending order) is retained.

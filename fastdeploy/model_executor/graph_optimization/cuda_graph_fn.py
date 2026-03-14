@@ -218,6 +218,27 @@ def _rebuild_args_with_buffers(
     return new_args, new_kwargs
 
 
+def _input_buffers_compatible(args, kwargs, buffers):
+    """
+    Check whether existing input_buffers match the current call's non-batch dimensions.
+
+    Buffer shape[0] (padded_size) is allowed to differ from real tensor shape[0].
+    All other dimensions (vocab_size, hidden_dim, etc.) and dtype must be identical;
+    otherwise the captured graph would operate on the wrong memory layout.
+    """
+    all_tensors = [a for a in args if isinstance(a, paddle.Tensor)] + [
+        v for v in kwargs.values() if isinstance(v, paddle.Tensor)
+    ]
+    if len(all_tensors) != len(buffers):
+        return False
+    for real_t, buf in zip(all_tensors, buffers):
+        if real_t.dtype != buf.dtype:
+            return False
+        if list(real_t.shape[1:]) != list(buf.shape[1:]):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # 核心后端类
 # ---------------------------------------------------------------------------
@@ -286,8 +307,21 @@ class CudaGraphFnBackend:
 
         entry = self.entries[padded_size]
 
-        # --- 分配 input_buffers（首次调用时惰性初始化）---
-        if entry.input_buffers is None:
+        # --- 分配 input_buffers（首次调用时或非 batch 维度变化时重新分配）---
+        need_alloc = entry.input_buffers is None
+        if not need_alloc and not _input_buffers_compatible(args, kwargs, entry.input_buffers):
+            need_alloc = True
+            if entry.captured:
+                entry.captured = False
+                entry.cuda_graph = None
+                entry.output_buffers = []
+                entry.num_finished_warmup = 0
+                logger.warning(
+                    f"[cuda_graph_fn] Input shapes changed for padded_size={padded_size}, "
+                    f"fn='{self.fn.__name__}' — invalidating capture and re-allocating buffers."
+                )
+
+        if need_alloc:
             entry.input_buffers = _alloc_input_buffers(args, kwargs, padded_size, self.size_from)
             logger.debug(
                 f"[cuda_graph_fn] Allocated input_buffers for padded_size={padded_size}, " f"fn='{self.fn.__name__}'"
@@ -310,42 +344,45 @@ class CudaGraphFnBackend:
         if not entry.captured:
             paddle.device.synchronize()
 
-            new_graph = _cuda_graphs.CUDAGraph(pool_id=self.pool_id)
-            new_graph.capture_begin()
-            outputs = self.fn(*buf_args, **buf_kwargs)
-            new_graph.capture_end()
+            # 第一步：在 capture 前执行一次 eager 调用，获取输出形状和 dtype，
+            # 预分配 output_buffers（普通 GPU 内存，不来自 pool）。
+            # 这样 capture 时可以用 paddle.assign 直接写入 output_buffers，
+            # 避免 pool 内存别名（aliasing）导致 replay 结果错误。
+            pre_outputs = self.fn(*buf_args, **buf_kwargs)
+            paddle.device.synchronize()
 
-            # 统一成 list 处理
-            single_output = isinstance(outputs, paddle.Tensor)
-            output_list = [outputs] if single_output else list(outputs)
+            single_output = isinstance(pre_outputs, paddle.Tensor)
+            output_list = [pre_outputs] if single_output else list(pre_outputs)
 
-            # 绑定输出 buffer（与 CudaGraphPiecewiseBackend:196-204 相同模式）
             entry.output_buffers = []
             for out in output_list:
                 if out is not None and isinstance(out, paddle.Tensor):
-                    buf = paddle.zeros_like(out)
-                    out._share_buffer_to(buf)
-                    entry.output_buffers.append(buf)
+                    entry.output_buffers.append(paddle.zeros_like(out))
                 else:
                     entry.output_buffers.append(out)
 
-            entry.cuda_graph = new_graph
-            entry.captured = True
             entry.output_is_single = single_output
 
-            # 立刻 replay 一次，将 capture 时的计算结果写入 output_buffers。
-            # 与 CudaGraphPiecewiseBackend 的 "capture 后紧跟 replay" 模式保持一致：
-            # capture_end() 后 output_buffers 里的内容还是 zeros，必须 replay 才有值。
-            entry.cuda_graph.replay()
+            # 第二步：正式 capture。函数内部的中间 Tensor 使用 pool 内存，
+            # 最终通过 paddle.assign 写入 output_buffers（普通 GPU 内存）。
+            # assign 操作被记录在 CUDA graph 中，replay 时直接写入固定地址。
+            new_graph = _cuda_graphs.CUDAGraph(pool_id=self.pool_id)
+            new_graph.capture_begin()
+            cap_outputs = self.fn(*buf_args, **buf_kwargs)
+            cap_list = [cap_outputs] if single_output else list(cap_outputs)
+            for cap_out, out_buf in zip(cap_list, entry.output_buffers):
+                if cap_out is not None and isinstance(cap_out, paddle.Tensor) and out_buf is not None:
+                    paddle.assign(cap_out, out_buf)
+            new_graph.capture_end()
+
+            entry.cuda_graph = new_graph
+            entry.captured = True
+
             paddle.device.synchronize()
 
             logger.info(
                 f"[cuda_graph_fn] CUDAGraph captured for padded_size={padded_size}, " f"fn='{self.fn.__name__}'"
             )
-
-            if single_output:
-                return entry.output_buffers[0]
-            return entry.output_buffers
 
         # --- Replay 阶段 ---
         entry.cuda_graph.replay()
