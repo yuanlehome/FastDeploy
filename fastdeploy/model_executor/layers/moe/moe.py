@@ -746,17 +746,20 @@ class FusedMoE(nn.Layer):
                 tensor_model_parallel_all_reduce_custom(out)
             return out
 
-        token_num = x.shape[0]
-        if (
-            self.ep_size > 1
-            and self.attn_tp_size > 1
-            and (not self.fd_config.parallel_config.use_sequence_parallel_moe)
-            and token_num >= self.attn_tp_size
-        ):
-            out = self.forward_split_allgather(
-                x, gate, topk_ids_hookfunc=topk_ids_hookfunc, shared_experts=shared_experts
-            )
-        elif self.fd_config.parallel_config.use_ep and self.fd_config.parallel_config.enable_chunked_moe:
+        # print(f"{x=}")
+
+        # token_num = x.shape[0]
+        # if (
+        #     self.ep_size > 1
+        #     and self.attn_tp_size > 1
+        #     and (not self.fd_config.parallel_config.use_sequence_parallel_moe)
+        #     and token_num >= self.attn_tp_size
+        # ):
+        #     out = self.forward_split_allgather(
+        #         x, gate, topk_ids_hookfunc=topk_ids_hookfunc, shared_experts=shared_experts
+        #     )
+        # el
+        if self.fd_config.parallel_config.use_ep and self.fd_config.parallel_config.enable_chunked_moe:
             out = self.forward_chunked_moe(
                 x, gate, forward_meta, topk_ids_hookfunc=topk_ids_hookfunc, shared_experts=shared_experts
             )
@@ -767,6 +770,8 @@ class FusedMoE(nn.Layer):
 
         if self.reduce_results and self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out, self.tp_group)
+        # print(f"moe_{out=}")
+
         return out
 
     def forward_chunked_moe(

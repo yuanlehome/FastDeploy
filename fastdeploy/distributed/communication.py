@@ -181,6 +181,57 @@ try:
             dist.all_reduce(input_)
         return input_
 
+    def tensor_model_parallel_reduce_scatter(
+        input_: paddle.Tensor,
+        group_: paddle.distributed.communication.group.Group = None,
+        split_sizes: list = None,
+    ) -> paddle.Tensor:
+        """reduce-scatter the input tensor across model parallel group.
+
+        Implemented via nranks calls to paddle.dist.reduce:
+        for each rank i, all ranks reduce their i-th chunk to rank i.
+
+        Args:
+            input_: input tensor, shape[0] is the dimension to scatter.
+            group_: model parallel group.
+            split_sizes: optional list of ints with length == nranks specifying
+                the size of each chunk along axis=0.  When None, chunks are
+                equal (input_.shape[0] // nranks each).
+        """
+        if input_.shape[0] == 0:
+            return input_
+        nranks = group_.nranks
+        my_rank = group_.rank
+        seq_len = input_.shape[0]
+
+        # Build start/end offsets from split_sizes or equal split.
+        if split_sizes is not None:
+            assert len(split_sizes) == nranks, f"split_sizes length {len(split_sizes)} != nranks {nranks}"
+            offsets = [0]
+            for s in split_sizes:
+                offsets.append(offsets[-1] + s)
+        else:
+            chunk_size = seq_len // nranks
+            offsets = [i * chunk_size for i in range(nranks + 1)]
+            offsets[-1] = seq_len  # absorb remainder into last chunk
+
+        # Each chunk[i] is reduced to global rank group_.ranks[i].
+        # dist.reduce expects a global rank for dst, not a group-local rank.
+        # Use slice views directly (no .clone()) so NCCL reads from the original
+        # input_ tensor that was already written on the compute stream — identical
+        # to the reduce_scatter+paddle.split approach.  NCCL never modifies the
+        # source buffer on non-root ranks, so views are safe.
+        # print(f"{input_.is_contiguous()=}")
+        out = None
+        for i in range(nranks):
+            chunk = input_[offsets[i] : offsets[i + 1], ...]
+            # print(f"{chunk.is_contiguous()=}")
+            dist.reduce(chunk.contiguous(), dst=group_.ranks[i], group=group_)
+            if i == my_rank:
+                out = chunk
+        # print(f"scatter_out: {out}")
+        return out
+
     @paddle.jit.marker.unified
     def decode_alltoall_transpose(
         input_: paddle.Tensor,

@@ -24,6 +24,7 @@ from fastdeploy.config import FDConfig
 from fastdeploy.distributed.communication import (
     decode_alltoall_transpose,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from fastdeploy.model_executor.layers.quantization.quant_base import QuantMethodBase
 from fastdeploy.model_executor.utils import (
@@ -946,7 +947,10 @@ class RowParallelLinear(LinearBase):
         out = self.quant_method.apply(self, x)
 
         if self.reduce_results and self.tp_size > 1:
-            out = tensor_model_parallel_all_reduce(out, self.tp_group)
+            if self.ep_size > 1:
+                out = tensor_model_parallel_reduce_scatter(out, self.tp_group)
+            else:
+                out = tensor_model_parallel_all_reduce(out, self.tp_group)
 
         return out
 

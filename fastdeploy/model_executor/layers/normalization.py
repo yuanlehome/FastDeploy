@@ -124,12 +124,15 @@ class RMSNorm(nn.Layer):
         is_input_norm = prefix.endswith(".input_layernorm")
         self.is_last_norm = prefix.endswith(".norm")
         self.split_x = (
-            self.fd_config.parallel_config.use_sequence_parallel_moe
+            self.ep_size > 1
+            and self.tp_size > 1
             and self.layer_id == self.fd_config.model_config.moe_layer_start_index
             and is_input_norm
         )
-        self.allgather_out = self.fd_config.parallel_config.use_sequence_parallel_moe and (
-            (self.layer_id > self.fd_config.model_config.moe_layer_start_index and is_input_norm)
+        self.allgather_out = (
+            self.ep_size > 1
+            and self.tp_size > 1
+            and ((self.layer_id > self.fd_config.model_config.moe_layer_start_index and is_input_norm))
         )
 
         self.init_weight()
@@ -202,6 +205,7 @@ class RMSNorm(nn.Layer):
         multi_outs = paddle.zeros([token_num_per_rank * self.tp_size, out.shape[1]], dtype=out.dtype)
         paddle.distributed.all_gather(multi_outs, out, self.tp_group)
         return multi_outs[:token_num, :]
+        # return paddle.rand([token_num, out.shape[1]], dtype=out.dtype)
 
     def forward(
         self,
@@ -272,9 +276,11 @@ class RMSNorm(nn.Layer):
         if self.split_x:
             assert residual_out is not None
             residual_out = self.split(residual_out)
+        # print(f"QKRMSNorm.forward 1 {out=}")
         if self.allgather_out:
             assert forward_meta is not None
             out = self.allgather(out, forward_meta.ids_remove_padding.shape[0])
+        # print(f"QKRMSNorm.forward 2 {out=}")
 
         return out, residual_out
 

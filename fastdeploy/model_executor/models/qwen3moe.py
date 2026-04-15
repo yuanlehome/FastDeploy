@@ -284,7 +284,11 @@ class Qwen3MoeModel(nn.Layer):
 
         out = self.norm(hidden_states, residual, forward_meta=forward_meta)[0]
 
-        if self.norm.is_last_norm and self.norm.fd_config.parallel_config.use_sequence_parallel_moe:
+        if (
+            self.norm.is_last_norm
+            and self.norm.fd_config.parallel_config.expert_parallel_size > 1
+            and self.norm.fd_config.parallel_config.tensor_parallel_size > 1
+        ):
             out = self.norm.allgather(out, forward_meta.ids_remove_padding.shape[0])
 
         return out
